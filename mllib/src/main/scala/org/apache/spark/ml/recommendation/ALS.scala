@@ -20,13 +20,18 @@ package org.apache.spark.ml.recommendation
 import java.{util => ju}
 import java.io.IOException
 
+import org.netlib.util.intW
+
 import scala.collection.mutable
 import scala.reflect.ClassTag
 import scala.util.{Sorting, Try}
 import scala.util.hashing.byteswap64
+import scala.util.control.Breaks._
+import scala.math
 
 import com.github.fommil.netlib.BLAS.{getInstance => blas}
-import org.apache.hadoop.fs.Path
+import com.github.fommil.netlib.LAPACK.{getInstance => lapack}
+import org.apache.hadoop.fs.{FileSystem, Path}
 import org.json4s.DefaultFormats
 import org.json4s.JsonDSL._
 
@@ -546,7 +551,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
     }
   }
 
-  /** Standard NNLS solver. */ 
+  /** Standard NNLS solver. */
   private[recommendation] class SingleRHSSolver extends LeastSquaresNESolver {
     private def getNonZeroIndex(Arr: Array[Int]): Array[Int] = {
         Arr.zipWithIndex.filter(_._1 != 0).map(_._2)} // generalize this to np.where()
@@ -555,12 +560,12 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
     
     private def fillAtA(ata: Array[Double]): Array[Double] = {
         val triK = ata.size
-        val r = (sqrt(8*triK + 1) - 1)/2 toInt
-        var res = Array.fill[Double](r*r)(0)
+        val r = ((math.sqrt(8 * triK + 1) - 1)/2).toInt
+        val res = Array.fill[Double]( r * r)(0)
         for (i <- 0 to r - 1; j <- i to r - 1) {
-            var v = ata(toVecIndex(i + 1, j + 1))
-            res(i + r*j) = v
-            res(i*r + j) = v
+            val v = ata(toVecIndex(i + 1, j + 1))
+            res(i + r * j) = v
+            res(i * r + j) = v
         }
         res
     }
@@ -583,12 +588,15 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
             val work = Array.fill[Double](lwork)(0)
             lapack.dgelsy(k, k, 1, AtAmat, k, Atb, k, jpvt, rcond, rank, work, lwork, info)
         }
-        Atb
+        return Atb
     }
-    
-    // solve for x in passive Submatrix AtA_p*x = Atb_p
-    // note: tol value to be set from outside
-    private def solveSubMatrix(ata: Array[Double], atb: Array[Double], PP: Array[Int]): Array[Double] = {
+
+    /** solve for x in passive Submatrix AtA_p*x = Atb_p
+      * note: tol value to be set from outside
+      */
+
+    private def solveSubMatrix(ata: Array[Double], atb: Array[Double],
+                               PP: Array[Int]): Array[Double] = {
         val r = atb.size
         val lenp = PP.size
         val atb_sub = PP.map(atb(_))
@@ -597,8 +605,8 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
         { ata_sub(toVecIndex(i, j)) = ata(toVecIndex(PP(i - 1) + 1, PP(j - 1) + 1)) }
         var z = Array.fill[Double](r)(0)
         var zp = solveLLS(ata_sub, atb_sub)
-        for (i <- 0 to PP.size - 1) z(PP(i)) = zp(i)
-        z
+        for (i <- 0 to PP.size - 1) { z(PP(i)) = zp(i) }
+        return z
     }
     
     private def getGrad(ata: Array[Double], atb: Array[Double], x: Array[Double]): Array[Double] = {
@@ -606,12 +614,12 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
         var w = Array.fill[Double](r)(0)
         blas.dspmv("U", r, -1.0, ata, x.clone, 1, 1.0, w, 1)
         blas.daxpy(w.size, 1.0, atb, 1, w, 1)
-        w
+        return w
     }
     
     private def SRHSsolve(ata: Array[Double], atb: Array[Double]): Array[Double] = {
-        val lambda = 1E-15
-        val eps = 2.22E-15 // value copied from Matlab's lsqnonneg
+	println("Solving NMF using Single RHS BPP...")
+	val eps = 2.22E-15 // value copied from Matlab's lsqnonneg
         val r = atb.size // rank
         val tol = 1E-12 // temporary tolerance value
         
@@ -619,14 +627,14 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
         var w = atb.clone
         
         var P = Array.fill[Int](r)(0) // initial passive set
-        var Z = 1 to r toArray // initial active set
+        var Z = (1 to r).toArray // initial active set
         var ZZ = Z.clone // have a copy of active set
         
-        var outerIter = 0 // counts number of iteration
-        var itmax = 3*r
-        var it = 0 // inner iter
+        var outerIter = 0 /** counts number of iteration */
+        val itmax = 3 * r
+        var it = 0 /** inner iter */
         
-        // which is faster: w.filter(_ > tol).size > 0) or w.reduceLeft(_ max _)
+        /** which is faster: w.filter(_ > tol).size > 0) or w.reduceLeft(_ max _) */
         breakable { while (Z.reduce(_+_) > 0 && w.reduceLeft(_ max _) > tol) {
             outerIter += 1
             // argmax for w
@@ -660,7 +668,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
  
                 // update passive and active sets
                 for (i <- 0 to r - 1){
-                    if ((abs(x(i)) < tol) && (P(i) != 0)){
+                    if ((math.abs(x(i)) < tol) && (P(i) != 0)){
                         Z(i) = i + 1
                         P(i) = 0
                 }}
@@ -672,8 +680,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
 
             x = z.clone
             w = getGrad(ata, atb, x)
-            
-            if (outerIter > itmax) break
+          if (outerIter > itmax) break
         }}
         return x
     }
@@ -697,7 +704,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       }
       ne.reset()
       x
-    }    
+    }
   }
 
   /** NNLS solver. */
