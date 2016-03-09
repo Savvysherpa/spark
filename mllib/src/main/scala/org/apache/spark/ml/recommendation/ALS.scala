@@ -561,9 +561,9 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
     private def fillAtA(ata: Array[Double]): Array[Double] = {
         val triK = ata.size
         val r = ((math.sqrt(8 * triK + 1) - 1)/2).toInt
-        val res = Array.fill[Double]( r * r)(0)
+        var res = Array.fill[Double]( r * r)(0)
         for (i <- 0 to r - 1; j <- i to r - 1) {
-            val v = ata(toVecIndex(i + 1, j + 1))
+            var v = ata(toVecIndex(i + 1, j + 1))
             res(i + r * j) = v
             res(i * r + j) = v
         }
