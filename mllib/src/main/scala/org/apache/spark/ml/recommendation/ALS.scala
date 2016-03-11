@@ -703,7 +703,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
         i += 1
       }
       ne.reset()
-      x
+      x.map(v => 0.0.toFloat)
     }
   }
 
