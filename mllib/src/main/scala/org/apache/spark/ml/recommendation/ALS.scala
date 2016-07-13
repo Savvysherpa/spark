@@ -43,7 +43,7 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util._
 import org.apache.spark.mllib.linalg.CholeskyDecomposition
-import org.apache.spark.mllib.optimization.NNLS
+import org.apache.spark.mllib.optimization.{NNLS, StandardNNLS}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset}
 import org.apache.spark.sql.functions._
@@ -553,138 +553,6 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
 
   /** Standard NNLS solver. */
   private[recommendation] class SingleRHSSolver extends LeastSquaresNESolver {
-    private def getNonZeroIndex(Arr: Array[Int]): Array[Int] = {
-        Arr.zipWithIndex.filter(_._1 != 0).map(_._2)} // generalize this to np.where()
-    
-    private def toVecIndex(i: Int, j: Int) = j*(j - 1)/2 + i - 1
-    
-    private def fillAtA(ata: Array[Double]): Array[Double] = {
-        val triK = ata.size
-        val r = ((math.sqrt(8 * triK + 1) - 1)/2).toInt
-        var res = Array.fill[Double]( r * r)(0)
-        for (i <- 0 to r - 1; j <- i to r - 1) {
-            var v = ata(toVecIndex(i + 1, j + 1))
-            res(i + r * j) = v
-            res(i * r + j) = v
-        }
-        res
-    }
-    
-    private def solveLLS(AtA: Array[Double], Atb: Array[Double]): Array[Double] = {
-        /** Attempts to solve for x in AtAx = Atb using choleskly decomposition.
-          * If AtA is not positive definite as determined by cholesky decomposition,
-          * the Least Squares Problem will be solved via dgelsy
-          */
-        val k = Atb.size
-        val info = new intW(0)
-        lapack.dppsv("U", k, 1, AtA, Atb, k, info)
-        val code = info.`val`
-        if (code != 0) {
-            val AtAmat = fillAtA(AtA)
-            val jpvt = Array.fill[Int](k)(0)
-            val rcond = 1e-5
-            val rank = new intW(k)
-            val lwork = 5*k // 4*k + 1 is not enough
-            val work = Array.fill[Double](lwork)(0)
-            lapack.dgelsy(k, k, 1, AtAmat, k, Atb, k, jpvt, rcond, rank, work, lwork, info)
-        }
-        return Atb
-    }
-
-    /** solve for x in passive Submatrix AtA_p*x = Atb_p
-      * note: tol value to be set from outside
-      */
-
-    private def solveSubMatrix(ata: Array[Double], atb: Array[Double],
-                               PP: Array[Int]): Array[Double] = {
-        val r = atb.size
-        val lenp = PP.size
-        val atb_sub = PP.map(atb(_))
-        var ata_sub = new Array[Double]((lenp*(lenp + 1))/2)
-        for (i <- 1 to lenp; j <- i to lenp) // or start with 0 perhaps?
-        { ata_sub(toVecIndex(i, j)) = ata(toVecIndex(PP(i - 1) + 1, PP(j - 1) + 1)) }
-        var z = Array.fill[Double](r)(0)
-        var zp = solveLLS(ata_sub, atb_sub)
-        for (i <- 0 to PP.size - 1) { z(PP(i)) = zp(i) }
-        return z
-    }
-    
-    private def getGrad(ata: Array[Double], atb: Array[Double], x: Array[Double]): Array[Double] = {
-        val r = x.size
-        var w = Array.fill[Double](r)(0)
-        blas.dspmv("U", r, -1.0, ata, x.clone, 1, 1.0, w, 1)
-        blas.daxpy(w.size, 1.0, atb, 1, w, 1)
-        return w
-    }
-    
-    private def SRHSsolve(ata: Array[Double], atb: Array[Double]): Array[Double] = {
-	println("Solving NMF using Single RHS BPP...")
-	val eps = 2.22E-15 // value copied from Matlab's lsqnonneg
-        val r = atb.size // rank
-        val tol = 1E-12 // temporary tolerance value
-        
-        var x = new Array[Double](r) // initialize x as zero vector of size n
-        var w = atb.clone
-        
-        var P = Array.fill[Int](r)(0) // initial passive set
-        var Z = (1 to r).toArray // initial active set
-        var ZZ = Z.clone // have a copy of active set
-        
-        var outerIter = 0 /** counts number of iteration */
-        val itmax = 3 * r
-        var it = 0 /** inner iter */
-        
-        /** which is faster: w.filter(_ > tol).size > 0) or w.reduceLeft(_ max _) */
-        breakable { while (Z.reduce(_+_) > 0 && w.reduceLeft(_ max _) > tol) {
-            outerIter += 1
-            // argmax for w
-            var argmax = 0.0
-            var t = 0
-            for (i <- 0 to r - 1){
-                if (argmax < w(i)){
-                    argmax = w(i)
-                    t = i
-            }}
-            t = Z(t)
-            P(t - 1) = t
-            Z(t - 1) = 0
-
-            var PP = getNonZeroIndex(P) // passive set indices
-            ZZ = getNonZeroIndex(Z) // active set indices
-            var z = solveSubMatrix(ata, atb, PP)
-            
-            // insert inner iter here
-            // error might occur when PP is an empty array. But, will this ever happen? No
-            
-            breakable { while (PP.map(z(_)).reduceLeft(_ min _) <= tol) {
-                it += 1
-                if (it > itmax) {
-                    println("Iteration count exceeded. Exiting...") 
-                    break 
-                }
-                var QQ = (0 to r - 1).toArray.filter(i => ((z(i) < tol) && (P(i) != 0)))
-                val alpha = QQ.map(i => (x(i) / (x(i) - z(i)))).reduceLeft(_ min _)
-                for (i <- 0 to x.size - 1) { x(i) += alpha*(z(i) - x(i))}
- 
-                // update passive and active sets
-                for (i <- 0 to r - 1){
-                    if ((math.abs(x(i)) < tol) && (P(i) != 0)){
-                        Z(i) = i + 1
-                        P(i) = 0
-                }}
-                
-                PP = getNonZeroIndex(P) // passive set indices
-                ZZ = getNonZeroIndex(Z) // active set indices
-                z = solveSubMatrix(ata, atb, PP)
-            }}
-
-            x = z.clone
-            w = getGrad(ata, atb, x)
-          if (outerIter > itmax) break
-        }}
-        return x
-    }
-
     override def solve(ne: NormalEquation, lambda: Double): Array[Float] = {
       val k = ne.k
       // Add scaled lambda to the diagonals of AtA.
@@ -695,15 +563,9 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
         i += j
         j += 1
       }
-      SRHSsolve(ne.ata, ne.atb)
-      val x = new Array[Float](k)
-      i = 0
-      while (i < k) {
-        x(i) = ne.atb(i).toFloat
-        i += 1
-      }
+      val x = StandardNNLS.solve(ne.ata, ne.atb)
       ne.reset()
-      x.map(v => 0.0.toFloat)
+      x.map(_.toFloat)
     }
   }
 
